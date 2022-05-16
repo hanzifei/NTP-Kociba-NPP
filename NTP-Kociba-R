@@ -1,0 +1,498 @@
+#### To run the code, must have the following packages
+
+library(mvtnorm)
+library(rstanarm)
+library(ggplot2)
+library(cowplot)
+library(KernSmooth)
+##########NPP##########
+
+##########Example: Logistic Regression GLM##########
+### Assume: prior of Beta is N (mu0 = rep(prior_mu, k), var0 = diag((prior_sd^2),k))
+###Step 1:Data
+Kociba <- read.csv("Kociba.csv")
+Y0 <- Kociba$y
+X0 <- cbind(1, Kociba$x)
+
+NTP <- read.csv("NTP.csv")
+Y <- NTP$y
+X <- cbind(1, NTP$x)
+
+###Step 2:Estimation
+beta0hat = glm.fit(x = X0, y = Y0, family = binomial(link = 'logit'))$coefficients
+betahat = glm.fit(x = X, y = Y, family = binomial(link = 'logit'))$coefficients
+
+### To reproduce the result in windows RNG; note that in the Mac, the result maybe differnent 
+### due to the package rstanarm RNG problem
+set.seed(111)
+
+###Step 3:Compute logC
+lgr_is_fun = function(dseq, Y0, X0, prior_mu, prior_sd, MCsize, cut, burnin, thin){   
+  D0 = data.frame(y = Y0, X0[, -1])
+  npar = ncol(X0)
+  n0 = nrow(X0)
+  prior_var = prior_sd^2
+  mu0 = rep(prior_mu, npar)  
+  sample_d0 = t(mvtnorm::rmvnorm(n = MCsize, mean = mu0, sigma = diag(prior_var, npar)))  
+  stanfit = rstanarm::stan_glm(y ~ ., data = D0, 
+                               family = stats::binomial(link = "logit"), 
+                               prior = rstanarm::normal(prior_mu, prior_sd), 
+                               prior_intercept = rstanarm::normal(prior_mu, prior_sd), 
+                               adapt_delta = 0.8, chains = 1, iter = MCsize*thin+burnin, 
+                               warmup = burnin, refresh = 0, thin = 5, cores = 1, seed = 123)             
+  sample_d1 = t(as.matrix(stanfit))
+  meanbeta = base::rowSums(sample_d1)/MCsize
+  const1 = -npar*log(prior_sd) 
+  llikFunMat = function(betaMat){
+    tmat = exp(X0 %*% betaMat)
+    tol11 = .Machine$double.xmin; tol22 = .Machine$double.xmax              
+    tmat[which(tmat >= tol22)] = tol22
+    tmat[which(tmat <= tol11)] = tol11
+    p = tmat/(1+tmat)
+    tol1 = 1e-8; tol2 = .Machine$double.xmin              
+    p[which(p > (1-tol1))] = 1-tol1
+    p[which(p < tol2)] = tol2
+    loglikmat = colSums(Y0*log(p)+(1-Y0)*log(1-p))
+    return(loglikmat)
+  }
+  lpriorFunMat = function(betaMat){
+    t = colSums((betaMat-mu0)^2)
+    return(const1-t/(2*prior_var))
+  }
+  lnp = llikFunMat(sample_d1)
+  lnprior = lpriorFunMat(sample_d1)
+  integrand_fun = function(d){
+    if(d <= cut){
+      lnpb1 = llikFunMat(sample_d0)
+      lnpb = d*lnpb1
+      num = exp(lnpb-max(lnpb))
+      denom = sum(num)
+      W = num/denom 
+    }else{
+      sample_d = sample_d1/sqrt(d)+meanbeta*(1-1/sqrt(d))
+      lnpriorb = lpriorFunMat(sample_d)
+      lnpb1 = llikFunMat(sample_d)
+      lnpb = d*lnpb1
+      num = exp(lnpriorb+lnpb-lnprior-lnp-max(lnpriorb+lnpb-lnprior-lnp))
+      denom = sum(num)
+      W = num/denom
+    }
+    est = sum(lnpb1*W)
+    es = sum(W)^2/sum(W^2)
+    return(list(est = est, es = es))
+  }
+  hd = lapply(dseq,integrand_fun)
+  est = c()
+  es = c()
+  m = length(dseq)
+  for(i in 1:m){
+    est[i] = hd[[i]]$est
+    es[i] = hd[[i]]$es
+  }
+  return(list(est = est, es = es))
+}
+
+dseq = (0:100/100)^2
+Ctmp = lgr_is_fun(dseq = dseq, Y0 = Y0, X0 = X0, prior_mu = 0, prior_sd = 10,
+                 MCsize = 10000, cut = 0.02, burnin = 5000, thin = 5)
+
+IS_logC = function(grid, logintgrand){
+  n_g = length(grid)
+  if(grid[1] == 0){
+    out = c(0, cumsum(diff(grid)*(logintgrand[1:(n_g-1)]+logintgrand[2:n_g])/2))
+  }else{
+    r = (logintgrand[2]-logintgrand[1])/(grid[2]-grid[1])
+    logintgrand0 = logintgrand[1]-r*grid[1]
+    grid = c(0, grid)
+    logintgrand = c(logintgrand0, logintgrand)
+    out = cumsum(diff(grid)*(logintgrand[1:n_g]+logintgrand[2:(n_g+1)])/2)
+  }
+  return(cbind(grid, out))
+}
+
+logC_grid = IS_logC(grid = dseq, logintgrand = Ctmp$est)
+
+## Briefly visualize the logC_grid
+plot(logC_grid, type = 'l')
+
+###Step 4:Metropolis-Hastings Algorithm
+lr_NPP_mcmc <- function(X, Y, X0, Y0, prior_beta = list(mu = 0, sd = 5), 
+                        prior_delta = list(alpha = 1, beta = 1), 
+                        logC_seq = list(delta, logC), beta_start = NULL, 
+                        prop_delta = "IND", rw_delta = 0.1, rw_n_beta = c(0.01, 0.04), 
+                        rw_u_beta = 0.1, ind_delta = c(1, 1), prop_beta = "NORMAL", 
+                        n_sample, burnin, thin){
+  if(is.null(beta_start)){
+    beta_start = betahat
+  }
+  k = ncol(X)
+  lprior0_beta = function(beta) -sum((beta-prior_beta$mu)^2)/(2*prior_beta$sd*prior_beta$sd)
+  lprior0_delta = function(d) (prior_delta$alpha-1)*log(d) + (prior_delta$beta-1)*log(1-d)
+  tol1 = 1e-8; tol2 = .Machine$double.xmin
+  
+  logCFun = function(d){                                     
+    id_l = sum(d-logC_seq$delta > 0); id_u = id_l+1
+    slope = (logC_seq$logC[id_u]-logC_seq$logC[id_l])/(logC_seq$delta[id_u]-logC_seq$delta[id_l])
+    dif = d-logC_seq$delta[id_l]
+    return(slope*dif + logC_seq$logC[id_l])
+  }
+  loglik0 = function(beta, d){
+    tmat = exp(X0 %*% beta)
+    p = tmat/(1+tmat)
+    p[which(p > (1-tol1))] = 1-tol1; p[which(p < tol2)] = tol2
+    out = colSums(Y0*log(p)+(1-Y0)*log(1-p))*d
+    return(out)
+  }
+  loglik = function(beta){
+    tmat = exp(X %*% beta)
+    p = tmat/(1+tmat)
+    p[which(p > (1-tol1))] = 1-tol1; p[which(p < tol2)] = tol2
+    out = colSums(Y*log(p)+(1-Y)*log(1-p))
+    return(out)
+  }
+  logPostDelta = function(d){                                
+    lprior0_delta(d)+loglik0(beta_cur, d)-logCFun(d)
+  }
+  logPostBeta = function(beta){                               
+    lprior0_beta(beta)+loglik0(beta, delta_cur)+loglik(beta)
+  }
+  # Matrix storing samples of the \beta parameter
+  beta_chain = matrix(0, nrow = n_sample, ncol = k)
+  delta_chain = rep(0, n_sample)
+  beta_cur = beta_chain[1, ]= beta_start
+  delta_cur = delta_chain[1] = 0.5
+  counter1 = 0; counter2 = 0
+  n_mcmc = n_sample*thin + burnin
+  
+  # Start MH algorithm
+  for (i in 2:n_mcmc) {
+    # Update delta
+    if(prop_delta == "IND"){
+      delta_prop = rbeta(1, ind_delta[1], ind_delta[2])
+      llik.prop = logPostDelta(delta_prop)
+      llik.cur = logPostDelta(delta_cur)
+      logr1 = min(0, (llik.prop-llik.cur+
+                        dbeta(delta_cur, shape1 = ind_delta[1], shape2 = ind_delta[2], log = TRUE) -
+                        dbeta(delta_prop, shape1 = ind_delta[1], shape2 = ind_delta[2], log = TRUE)))
+    }
+    if(prop_delta == "RW"){
+      lgdelta_cur = log(delta_cur/(1-delta_cur))
+      lgdelta_prop = rnorm(1, mean = lgdelta_cur, sd = rw_delta)
+      delta_prop = exp(lgdelta_prop)/(1+exp(lgdelta_prop))
+      llik.prop = logPostDelta(delta_prop)
+      llik.cur = logPostDelta(delta_cur)
+      logr1 = min(0, (llik.prop-llik.cur+
+                        log(delta_prop)+log(1-delta_prop)-log(delta_cur)-log(1-delta_cur)))
+    }
+    if(runif(1) <= exp(logr1)){
+      delta_cur = delta_prop; counter1 = counter1+1
+    }
+    if( i > burnin & (i-burnin) %% thin==0) {
+      delta_chain[(i-burnin)/thin] = delta_cur
+    }
+    # Update beta
+    if(prop_beta == "NORMAL"){
+      beta_prop = rnorm(k, mean = beta_cur, sd = rw_n_beta)
+      logr2 = min(0, logPostBeta(beta_prop)-logPostBeta(beta_cur))
+    }
+    if(prop_beta == "UNIF"){
+      beta_prop = runif(k, min = beta_cur-rw_u_beta, max = beta_cur+rw_u_beta)
+      logr2 = min(0, logPostBeta(beta_prop)-logPostBeta(beta_cur))
+    }
+    if(runif(1) <= exp(logr2)){
+      beta_cur = beta_prop; counter2 = counter2+1
+    }
+    if( i > burnin & (i-burnin) %% thin==0) {
+      beta_chain[(i-burnin)/thin, ] = beta_cur
+    }
+  }
+  sample = cbind(beta_chain, delta_chain)
+  return(list(sample = cbind(beta_chain, delta_chain), 
+              accept = c(counter1/n_mcmc, counter2/n_mcmc)))
+}
+
+outcome_NPP <- lr_NPP_mcmc(X = X, Y = Y, X0 = X0, Y0 = Y0, prior_beta = list(mu = 0, sd = 10), 
+                       prior_delta = list(alpha = 1, beta = 1), 
+                       logC_seq = list(delta = logC_grid[,1], logC = logC_grid[,2]), 
+                       prop_delta = "IND", rw_n_beta = c(0.15, 0.02), ind_delta = c(1, 1), 
+                       prop_beta = "NORMAL", n_sample = 10000, burnin = 5000, thin = 5)
+
+########## Posterior MCMC done for NPP. Now we start the Partial NPP##########
+
+###Step 4: Metropolis-Hastings Algorithm
+lr_PNPP_mcmc <- function(X, Y, X0, Y0, prior_beta00 = list(mu = 0, sd = 5), 
+                         prior_beta0 = list(mu = 0, sd = 5),
+                         prior_beta1 = list(mu = 0, sd = 5),
+                         prior_delta = list(alpha = 1, beta = 1), 
+                         logC_seq = list(delta, logC), beta00_start = NULL,
+                         beta0_start = NULL, beta1_start = NULL,
+                         prop_delta = "IND", rw_delta = 0.1, rw_n_beta = c(0.1, 0.1, 0.1), 
+                         rw_u_beta = 0.1, ind_delta = c(1, 1), prop_beta00 = "NORMAL",
+                         prop_beta0 = "NORMAL", prop_beta1 = "NORMAL",
+                         n_sample, burnin, thin){
+  
+  if(is.null(beta00_start)){
+    beta00_start = beta0hat[1]
+  }
+  if(is.null(beta0_start)){
+    beta0_start = betahat[1]
+  }
+  if(is.null(beta1_start)){
+    beta1_start = betahat[2]
+  }
+  lprior0_beta00 = function(beta00) -sum((beta00-prior_beta00$mu)^2)/(2*prior_beta00$sd*prior_beta00$sd)
+  lprior0_beta0 = function(beta0) -sum((beta0-prior_beta0$mu)^2)/(2*prior_beta0$sd*prior_beta0$sd)
+  lprior0_beta1 = function(beta1) -sum((beta1-prior_beta1$mu)^2)/(2*prior_beta1$sd*prior_beta1$sd)
+  lprior0_delta = function(d) (prior_delta$alpha-1)*log(d) + (prior_delta$beta-1)*log(1-d)
+  tol1 = 1e-8; tol2 = .Machine$double.xmin
+  
+  logCFun = function(d){                                     
+    id_l = sum(d-logC_seq$delta > 0); id_u = id_l+1
+    slope = (logC_seq$logC[id_u]-logC_seq$logC[id_l])/(logC_seq$delta[id_u]-logC_seq$delta[id_l])
+    dif = d-logC_seq$delta[id_l]
+    return(slope*dif + logC_seq$logC[id_l])
+  }
+  loglik0 = function(beta00, beta1, d){
+    tmat = exp(X0 %*% c(beta00, beta1))
+    p = tmat/(1+tmat)
+    p[which(p > (1-tol1))] = 1-tol1; p[which(p < tol2)] = tol2
+    out = colSums(Y0*log(p)+(1-Y0)*log(1-p))*d
+    return(out)
+  }
+  loglik = function(beta0, beta1){
+    tmat = exp(X %*% c(beta0, beta1))
+    p = tmat/(1+tmat)
+    p[which(p > (1-tol1))] = 1-tol1; p[which(p < tol2)] = tol2
+    out = colSums(Y*log(p)+(1-Y)*log(1-p))
+    return(out)
+  }
+  logPostDelta = function(d){                                
+    lprior0_delta(d)+loglik0(beta00_cur, beta1_cur, d)-logCFun(d)
+  }
+  logPostBeta00 = function(beta00){                               
+    lprior0_beta00(beta00)+loglik0(beta00, beta1_cur, delta_cur)
+  }
+  logPostBeta0 = function(beta0){                               
+    lprior0_beta0(beta0)+loglik(beta0, beta1_cur)
+  }
+  logPostBeta1 = function(beta1){                               
+    lprior0_beta1(beta1)+loglik0(beta00_cur, beta1, delta_cur)+loglik(beta0_cur, beta1)
+  }
+  # Storing samples of the \beta parameter
+  beta00_chain = rep(0, n_sample); beta0_chain = rep(0, n_sample)
+  beta1_chain = rep(0, n_sample); delta_chain = rep(0, n_sample)
+  beta00_cur = beta00_chain[1] = beta00_start
+  beta0_cur = beta0_chain[1] = beta0_start
+  beta1_cur = beta1_chain[1] = beta1_start
+  delta_cur = delta_chain[1] = 0.5
+  counter1 = 0; counter2 = 0; counter3 = 0; counter4 = 0
+  n_mcmc = n_sample*thin + burnin
+  
+  # Start MH algorithm
+  for (i in 2:n_mcmc) {
+    # Update delta
+    if(prop_delta == "IND"){
+      delta_prop = rbeta(1, ind_delta[1], ind_delta[2])
+      llik.prop = logPostDelta(delta_prop)
+      llik.cur = logPostDelta(delta_cur)
+      logr1 = min(0, (llik.prop-llik.cur+
+                        dbeta(delta_cur, shape1 = ind_delta[1], shape2 = ind_delta[2], log = TRUE) -
+                        dbeta(delta_prop, shape1 = ind_delta[1], shape2 = ind_delta[2], log = TRUE)))
+    }
+    if(prop_delta == "RW"){
+      lgdelta_cur = log(delta_cur/(1-delta_cur))
+      lgdelta_prop = rnorm(1, mean = lgdelta_cur, sd = rw_delta)
+      delta_prop = exp(lgdelta_prop)/(1+exp(lgdelta_prop))
+      llik.prop = logPostDelta(delta_prop)
+      llik.cur = logPostDelta(delta_cur)
+      logr1 = min(0, (llik.prop-llik.cur+
+                        log(delta_prop)+log(1-delta_prop)-log(delta_cur)-log(1-delta_cur)))
+    }
+    if(runif(1) <= exp(logr1)){
+      delta_cur = delta_prop; counter1 = counter1+1
+    }
+    if( i > burnin & (i-burnin) %% thin==0) {
+      delta_chain[(i-burnin)/thin] = delta_cur
+    }
+    # Update beta00
+    if(prop_beta00 == "NORMAL"){
+      beta00_prop = rnorm(1, mean = beta00_cur, sd = rw_n_beta[1])
+      logr2 = min(0, logPostBeta00(beta00_prop)-logPostBeta00(beta00_cur))
+    }
+    if(prop_beta00 == "UNIF"){
+      beta00_prop = runif(1, min = beta00_cur-rw_u_beta, max = beta00_cur+rw_u_beta)
+      logr2 = min(0, logPostBeta00(beta00_prop)-logPostBeta00(beta00_cur))
+    }
+    if(runif(1) <= exp(logr2)){
+      beta00_cur = beta00_prop; counter2 = counter2+1
+    }
+    if( i > burnin & (i-burnin) %% thin==0) {
+      beta00_chain[(i-burnin)/thin] = beta00_cur
+    }
+    # Update beta0
+    if(prop_beta0 == "NORMAL"){
+      beta0_prop = rnorm(1, mean = beta0_cur, sd = rw_n_beta[2])
+      logr3 = min(0, logPostBeta0(beta0_prop)-logPostBeta0(beta0_cur))
+    }
+    if(prop_beta0 == "UNIF"){
+      beta0_prop = runif(1, min = beta0_cur-rw_u_beta, max = beta0_cur+rw_u_beta)
+      logr3 = min(0, logPostBeta0(beta0_prop)-logPostBeta0(beta0_cur))
+    }
+    if(runif(1) <= exp(logr3)){
+      beta0_cur = beta0_prop; counter3 = counter3+1
+    }
+    if( i > burnin & (i-burnin) %% thin==0) {
+      beta0_chain[(i-burnin)/thin] = beta0_cur
+    }
+    # Update beta1
+    if(prop_beta1 == "NORMAL"){
+      beta1_prop = rnorm(1, mean = beta1_cur, sd = rw_n_beta[3])
+      logr4 = min(0, logPostBeta1(beta1_prop)-logPostBeta1(beta1_cur))
+    }
+    if(prop_beta1 == "UNIF"){
+      beta1_prop = runif(1, min = beta1_cur-rw_u_beta, max = beta1_cur+rw_u_beta)
+      logr4 = min(0, logPostBeta1(beta1_prop)-logPostBeta1(beta1_cur))
+    }
+    if(runif(1) <= exp(logr4)){
+      beta1_cur = beta1_prop; counter4 = counter4+1
+    }
+    if( i > burnin & (i-burnin) %% thin==0) {
+      beta1_chain[(i-burnin)/thin] = beta1_cur
+    }
+  }
+  sample = cbind(beta00_chain,beta0_chain,beta1_chain,delta_chain)
+  accept1 = counter1/n_mcmc
+  accept2 = counter2/n_mcmc
+  accept3 = counter3/n_mcmc
+  accept4 = counter4/n_mcmc
+  return(list(sample = cbind(beta00_chain,beta0_chain,beta1_chain,delta_chain), 
+              accept = c(accept1, accept2, accept3, accept4)))
+}
+
+outcome_PNPP <- lr_PNPP_mcmc(X = X, Y = Y, X0 = X0, Y0 = Y0, prior_beta00 = list(mu = 0, sd = 10), 
+                             prior_beta0 = list(mu = 0, sd = 10), prior_beta1 = list(mu = 0, sd = 10),
+                             prior_delta = list(alpha = 1, beta = 1), 
+                             logC_seq = list(delta = logC_grid[,1], logC = logC_grid[,2]), 
+                             prop_delta = "IND", rw_delta = 0.1, rw_n_beta = c(1, 1, 0.01), 
+                             ind_delta = c(1, 1), prop_beta00 = "NORMAL", prop_beta0 = "NORMAL", prop_beta1 = "NORMAL", 
+                             n_sample = 10000, burnin = 5000, thin = 5)
+
+
+###Step 5:Plot
+#trace plot
+iterations <- seq(1:10000)
+a <- data.frame(iterations,outcome_NPP$sample[,1])
+b <- data.frame(iterations,outcome_PNPP$sample[,2])
+a2 <- data.frame(iterations,outcome_NPP$sample[,2])
+b2 <- data.frame(iterations,outcome_PNPP$sample[,3])
+
+p1 = ggplot(a,aes(x=iterations,y=outcome_NPP$sample[,1]))+geom_line()+
+  labs(x="iterations",y=expression(beta['0']))+
+  scale_y_continuous(breaks=c(-4.0,-3.5,-3.0,-2.5,-2.0),limits = c(-4.1,-2.0))
+p2 = ggplot(b,aes(x=iterations,y=outcome_PNPP$sample[,2]))+geom_line()+
+  labs(x="iterations",y=expression(beta['0']))+
+  scale_y_continuous(breaks=c(-4.0,-3.5,-3.0,-2.5,-2.0),limits = c(-4.1,-2.0))
+p3 = ggplot(a2,aes(x=iterations,y=outcome_NPP$sample[,2]))+geom_line()+
+  labs(x="iterations",y=expression(beta['1']))+
+  scale_y_continuous(breaks=c(0.01,0.02,0.03,0.04,0.05),limits = c(0.007,0.05))
+p4 = ggplot(b2,aes(x=iterations,y=outcome_PNPP$sample[,3]))+geom_line()+
+  labs(x="iterations",y=expression(beta['1']))+
+  scale_y_continuous(breaks=c(0.01,0.02,0.03,0.04,0.05),limits = c(0.007,0.05))
+p <- plot_grid(p1,p2,p3,p4,ncol=2,nrow=2)
+
+#density
+delta1 = outcome_NPP$sample[,3]
+delta2 = outcome_PNPP$sample[,4]
+
+p5 = ggplot(data.frame(delta1),aes(x = delta1))+geom_density(color = "black",bw=0.02)+
+  labs(x=expression(delta),y="density")
+p6 = ggplot(data.frame(delta2),aes(x = delta2))+geom_density(color = "black",bw=0.09)+
+  labs(x=expression(delta),y="density")
+pp <- plot_grid(p5,p6,ncol=2, nrow=1)
+
+###Step 7:Posterior estimation
+#mean
+round(colMeans(outcome_NPP$sample), 3)
+#-2.847       0.027       0.125 
+round(colMeans(outcome_PNPP$sample)[2:4], 3)
+# -3.048        0.027        0.558
+
+#hpd
+emp.hpd <- function(x,conf){
+  conf <- min(conf,1-conf)
+  n <- length(x)
+  nn <- round(n*conf)
+  x <- sort(x)
+  xx <- x[(n-nn+1):n]-x[1:nn]
+  m <- min(xx)
+  nnn <- which(xx==m)[1]
+  return(c(x[nnn],x[n-nn+nnn]))
+}
+
+
+round(emp.hpd(outcome_NPP$sample[,1],0.95), 3)
+#[1]-3.596 -2.252
+round(emp.hpd(outcome_PNPP$sample[,2],0.95), 3)
+#[1] -3.664 -2.480
+
+round(emp.hpd(outcome_NPP$sample[,2],0.95), 3)
+#[1] 0.015 0.039
+round(emp.hpd(outcome_PNPP$sample[,3],0.95), 3)
+#[1] 0.018 0.036
+
+
+round(emp.hpd(outcome_NPP$sample[,3],0.95), 3)
+#[1] 0.004 0.338
+round(emp.hpd(outcome_PNPP$sample[,4],0.95), 3)
+#[1] 0.107 0.999
+
+#mode
+mod_NPP <- bkde(outcome_NPP$sample[,3])
+round(mod_NPP$x[which(mod_NPP$y == max(mod_NPP$y))], 3)
+#[1] 0.054
+
+#mode
+mod_PNPP <- bkde(outcome_PNPP$sample[,4])
+round(mod_PNPP$x[which(mod_PNPP$y == max(mod_PNPP$y))], 3)
+#[1] 0.807
+
+
+###No borrowing###
+MCsize = 10000; burnin = 5000; thin = 5
+stanfit = rstanarm::stan_glm(y1 ~ ., data = as.data.frame(NTP), 
+                             family = stats::binomial(link = "logit"), 
+                             prior = rstanarm::normal(0, 10), 
+                             prior_intercept = rstanarm::normal(0, 10), 
+                             adapt_delta = 0.8, chains = 1,  
+                             iter = MCsize*thin+burnin, thin = thin,
+                             warmup = burnin, refresh = 0, cores = 1, seed = 123) 
+beta_no = as.matrix(stanfit)
+#Estimation
+round(mean(beta_no[,1]),3)
+#-3.023
+round(emp.hpd(beta_no[,1],0.95),3)
+#-3.761 -2.342 
+round(mean(beta_no[,2]),3)
+#0.026
+round(emp.hpd(beta_no[,2],0.95),3)
+#0.012 0.040
+
+###Full borrowing###
+data_c <- data.frame(y = c(Kociba$y, NTP$y1), x = c(Kociba$x, NTP$x1))
+stanfit = rstanarm::stan_glm(y ~ ., data = data_c, 
+                             family = stats::binomial(link = "logit"), 
+                             prior = rstanarm::normal(0, 10), 
+                             prior_intercept = rstanarm::normal(0, 10), 
+                             adapt_delta = 0.8, chains = 1,  
+                             iter = MCsize*thin+burnin, thin = thin,
+                             warmup = burnin, refresh = 0, cores = 1, seed = 123) 
+beta_full = as.matrix(stanfit)
+#Estimation
+round(mean(beta_full[,1]),3)
+#-2.301
+round(emp.hpd(beta_full[,1],0.95),3)
+#-2.656 -1.941 
+round(mean(beta_full[,2]),3)
+#0.027
+round(emp.hpd(beta_full[,2],0.95),3)
+#0.021 0.034
